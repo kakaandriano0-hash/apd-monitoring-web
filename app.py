@@ -332,7 +332,7 @@ with tab_video:
     )
     frame_stride = st.number_input(
         "Proses setiap N frame (1 = semua frame)",
-        min_value=1, max_value=60, value=2, step=1
+        min_value=1, max_value=60, value=1, step=1
     )
     st.caption(
         "Untuk hosting gratis, mulai dengan video pendek. Video panjang atau resolusi "
