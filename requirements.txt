@@ -4,3 +4,4 @@ opencv-python==4.10.0.84
 pillow>=10.0
 numpy>=1.26,<2.0
 lap>=0.5.12
+pandas>=2.0
