@@ -105,15 +105,22 @@ def load_models(ppe_model_path, person_model_path):
     return ppe_model, person_model
 
 
-def run_detection(frame_bgr, ppe_model, person_model, ppe_conf, person_conf, imgsz):
+def run_detection(frame_bgr, ppe_model, person_model, ppe_conf, person_conf, imgsz, track_people=False):
     output = frame_bgr.copy()
 
     ppe_result = ppe_model.predict(
         source=frame_bgr, conf=ppe_conf, imgsz=imgsz, verbose=False
     )[0]
-    person_result = person_model.predict(
-        source=frame_bgr, classes=[0], conf=person_conf, imgsz=imgsz, verbose=False
-    )[0]
+    if track_people:
+        # ByteTrack mempertahankan ID orang antar-frame selama masih dapat dilacak.
+        person_result = person_model.track(
+            source=frame_bgr, classes=[0], conf=person_conf, imgsz=imgsz,
+            tracker="bytetrack.yaml", persist=True, verbose=False
+        )[0]
+    else:
+        person_result = person_model.predict(
+            source=frame_bgr, classes=[0], conf=person_conf, imgsz=imgsz, verbose=False
+        )[0]
 
     ppe_detections = []
     if ppe_result.boxes is not None:
@@ -130,9 +137,16 @@ def run_detection(frame_bgr, ppe_model, person_model, ppe_conf, person_conf, img
     if person_result.boxes is not None:
         for b in person_result.boxes:
             coords = b.xyxy[0].cpu().numpy().astype(int).tolist()
+            track_id = None
+            if track_people and person_result.boxes.id is not None:
+                try:
+                    track_id = int(person_result.boxes.id[len(people)].item())
+                except (IndexError, TypeError, ValueError):
+                    track_id = None
             people.append({
                 "box": tuple(coords),
                 "confidence": float(b.conf[0].item()),
+                "track_id": track_id,
                 "ppe": set(),
                 "ppe_conf": {},
             })
@@ -174,13 +188,16 @@ def run_detection(frame_bgr, ppe_model, person_model, ppe_conf, person_conf, img
 
         x1, y1, x2, y2 = person["box"]
         cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
-        label = f"Person {idx}: {status}"
+        person_label = f"ID {person['track_id']}" if person.get("track_id") is not None else f"Person {idx}"
+        label = f"{person_label}: {status} ({len(detected)}/{len(REQUIRED_PPE)} APD)"
         cv2.putText(output, label, (x1, max(20, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         reports.append({
-            "Person": idx,
+            "Person": (person.get("track_id") if person.get("track_id") is not None else (None if track_people else idx)),
             "Status": status,
+            "Jumlah APD terdeteksi": len(detected),
+            "Kelengkapan APD (%)": round(100 * len(detected) / len(REQUIRED_PPE)),
             "APD terdeteksi": ", ".join(
                 DISPLAY_NAMES.get(x, x) for x in sorted(detected)
             ) if detected else "Belum ada APD terdeteksi",
@@ -223,8 +240,9 @@ def show_summary(summary):
     c4.metric("APD tidak terasosiasi", summary["unassigned_count"])
 
     st.caption(
-        "*'Lengkap' berarti kelima kelas APD berhasil dideteksi dan diasosiasikan "
-        "oleh heuristik ini; bukan jaminan kepatuhan keselamatan."
+        "Persentase kelengkapan = jumlah kelas APD berbeda yang terdeteksi / 5 × 100%. "
+        "Kelas yang dihitung: Helmet, Mask, Safety Vest, Boots, Gloves. Ini perkiraan "
+        "berdasarkan deteksi dan asosiasi bounding box, bukan jaminan kepatuhan keselamatan."
     )
     st.subheader("Jumlah deteksi APD")
     if summary["ppe_counts"]:
@@ -314,7 +332,7 @@ with tab_video:
     )
     frame_stride = st.number_input(
         "Proses setiap N frame (1 = semua frame)",
-        min_value=1, max_value=60, value=1, step=1
+        min_value=1, max_value=60, value=2, step=1
     )
     st.caption(
         "Untuk hosting gratis, mulai dengan video pendek. Video panjang atau resolusi "
@@ -360,6 +378,10 @@ with tab_video:
                 frame_idx = 0
                 processed = 0
                 latest_summary = None
+                # Rekap kumulatif per ID tracking sepanjang video.
+                cumulative_people = {}
+                cumulative_ppe_counts = {}
+                cumulative_unassigned = 0
                 stop_after = total_frames if max_frames == 0 else min(total_frames, int(max_frames))
 
                 while True:
@@ -370,9 +392,30 @@ with tab_video:
                     if frame_idx % int(frame_stride) == 0:
                         annotated, latest_summary = run_detection(
                             frame, ppe_model, person_model,
-                            ppe_conf, person_conf, imgsz
+                            ppe_conf, person_conf, imgsz, track_people=True
                         )
                         processed += 1
+                        cumulative_unassigned += latest_summary.get("unassigned_count", 0)
+                        for label, count in latest_summary.get("ppe_counts", {}).items():
+                            cumulative_ppe_counts[label] = max(cumulative_ppe_counts.get(label, 0), count)
+                        for report in latest_summary.get("reports", []):
+                            person_id = report.get("Person")
+                            # Tracking IDs memungkinkan orang yang sama digabung antar-frame.
+                            if person_id is None:
+                                continue
+                            rec = cumulative_people.setdefault(person_id, {
+                                "Person": person_id, "seen_frames": 0,
+                                "ppe_classes": set(), "confidence_person": 0.0,
+                                "ppe_conf": {}
+                            })
+                            rec["seen_frames"] += 1
+                            rec["confidence_person"] = max(rec["confidence_person"], report.get("Confidence person", 0.0))
+                            for cls in REQUIRED_PPE:
+                                display = DISPLAY_NAMES[cls]
+                                if display in report.get("APD terdeteksi", ""):
+                                    rec["ppe_classes"].add(cls)
+                            for cls, conf in report.get("Confidence APD", {}).items():
+                                rec["ppe_conf"][cls] = max(rec["ppe_conf"].get(cls, 0.0), conf)
                     else:
                         # Reuse previous annotated frame only for display continuity.
                         # This is not a fresh inference for skipped frames.
@@ -409,12 +452,42 @@ with tab_video:
                     mime="video/mp4"
                 )
                 if latest_summary:
-                    st.subheader("Ringkasan frame terakhir yang dianalisis")
-                    show_summary(latest_summary)
+                    # Susun ringkasan akhir: satu baris per ID orang yang pernah dilacak.
+                    cumulative_reports = []
+                    complete_count = 0
+                    for person_id, rec in sorted(cumulative_people.items(), key=lambda x: x[0]):
+                        detected = rec["ppe_classes"]
+                        missing = set(REQUIRED_PPE) - detected
+                        percent = round(100 * len(detected) / len(REQUIRED_PPE))
+                        status = "5/5 APD terdeteksi" if not missing else "Perlu verifikasi"
+                        if not missing:
+                            complete_count += 1
+                        cumulative_reports.append({
+                            "Person ID": person_id,
+                            "Status akhir": status,
+                            "Jumlah APD terdeteksi": f"{len(detected)}/5",
+                            "Kelengkapan APD (%)": percent,
+                            "APD pernah terdeteksi": ", ".join(DISPLAY_NAMES[x] for x in REQUIRED_PPE if x in detected) or "Belum ada",
+                            "Belum terdeteksi sepanjang video": ", ".join(DISPLAY_NAMES[x] for x in REQUIRED_PPE if x in missing) or "-",
+                            "Frame terlihat": rec["seen_frames"],
+                        })
+                    st.subheader("Rekap kumulatif sepanjang video")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Orang unik terlacak", len(cumulative_people))
+                    m2.metric("Orang dengan 5/5 APD", complete_count)
+                    m3.metric("Frame dianalisis", processed)
                     st.caption(
-                        "Ringkasan ini berasal dari frame terakhir yang dianalisis, "
-                        "bukan akumulasi unik pekerja sepanjang video."
+                        "Orang unik dihitung menggunakan ID ByteTrack. Persentase APD adalah "
+                        "gabungan kelas APD yang pernah terdeteksi pada orang tersebut di frame-frame "
+                        "yang dianalisis; bukan berarti APD dipakai dengan benar pada setiap saat. "
+                        "Jika ID tracking terputus atau berubah, satu orang bisa terhitung lebih dari sekali."
                     )
+                    if cumulative_reports:
+                        st.dataframe(cumulative_reports, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("Tidak ada orang yang berhasil dilacak pada video ini.")
+                    st.subheader("Ringkasan frame terakhir")
+                    show_summary(latest_summary)
             except Exception as e:
                 st.error(f"Gagal memproses video: {e}")
             finally:
